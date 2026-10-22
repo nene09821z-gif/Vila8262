@@ -1,4 +1,4 @@
-name: Chess Bot Android APK — WORKFLOW FIX V6
+name: Chess Bot Android APK — WORKFLOW FIX V7
 
 "on":
   workflow_dispatch:
