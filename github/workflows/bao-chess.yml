@@ -64,46 +64,46 @@ jobs:
           def safe_extract(archive, dest):
               with zipfile.ZipFile(archive) as zf:
                   entries = zf.infolist()
-                  if len(entries) > 12000:
-                      raise SystemExit(f"{archive.name}: too many entries")
-                  if sum(e.file_size for e in entries) > 700 * 1024 * 1024:
-                      raise SystemExit(f"{archive.name}: expanded size exceeds 700 MB")
-                  bad = zf.testzip()
-                  if bad:
-                      raise SystemExit(f"{archive.name}: corrupt entry {bad}")
+                  nếu len(entries) > 12000:
+                      raise SystemExit(f"{archive.name}: quá nhiều mục nhập")
+                  nếu tổng (kích thước tệp của e cho mỗi mục nhập) > 700 * 1024 * 1024:
+                      raise SystemExit(f"{archive.name}: kích thước mở rộng vượt quá 700 MB")
+                  xấu = zf.testzip()
+                  nếu xấu:
+                      raise SystemExit(f"{archive.name}: mục nhập bị hỏng {bad}")
                   root = dest.resolve()
-                  for e in entries:
+                  đối với e trong các mục nhập:
                       p = pathlib.PurePosixPath(e.filename)
-                      if p.is_absolute() or ".." in p.parts:
-                          raise SystemExit(f"{archive.name}: unsafe path {e.filename}")
-                      if root not in (root / e.filename).resolve().parents and (root / e.filename).resolve() != root:
-                          raise SystemExit(f"{archive.name}: path escapes target {e.filename}")
+                      nếu p.is_absolute() hoặc ".." trong p.parts:
+                          raise SystemExit(f"{archive.name}: đường dẫn không an toàn {e.filename}")
+                      nếu root không nằm trong (root / e.filename).resolve().parents và (root / e.filename).resolve() != root:
+                          raise SystemExit(f"{archive.name}: đường dẫn thoát mục tiêu {e.filename}")
                   zf.extractall(dest)
 
           def find_projects(base):
-              found = [p.parent for p in base.rglob("package.json")
+              tìm thấy = [p.parent cho p trong base.rglob("package.json")
                        if "node_modules" not in p.parts and (p.parent / "capacitor.config.json").is_file()]
               found.sort(key=lambda p: (len(p.parts), str(p)))
-              return found
+              trả về đã tìm thấy
 
           zips = sorted(ws.glob("*.zip"), key=vkey)
           is_patch = lambda p: "patch-only" in p.name.lower()
           fulls = [p for p in zips if not is_patch(p) and re.match(r"(?i)(vila|co[_-]?vua)", p.name)]
           patches = [p for p in zips if is_patch(p)]
 
-          if requested:
-              base = ws / requested
-              if not base.is_file():
+          nếu được yêu cầu:
+              cơ sở = ws / yêu cầu
+              nếu không phải base.is_file():
                   raise SystemExit(f"source_zip not found: {requested}")
-          else:
-              base = fulls[-1] if fulls else None
+          khác:
+              base = fulls[-1] nếu fulls ngược lại là None
 
-          if base is None:
+          nếu base là None:
               if (ws / "package.json").is_file() and (ws / "capacitor.config.json").is_file():
-                  print("No source ZIP found; using the repository root as the project.")
-                  project = ws
-              else:
-                  raise SystemExit("No full source ZIP (vila-chess*.zip, not *patch-only*) and no Capacitor project at the repo root.")
+                  print("Không tìm thấy tệp ZIP nguồn; đang sử dụng thư mục gốc của kho lưu trữ làm dự án.")
+                  dự án = ws
+              khác:
+                  raise SystemExit("Không tìm thấy tệp ZIP mã nguồn đầy đủ (vila-chess*.zip, không phải *chỉ bản vá*) và không có dự án Capacitor nào ở thư mục gốc của kho lưu trữ.")
           else:
               print(f"Base source ZIP: {base.name}")
               safe_extract(base, out)
