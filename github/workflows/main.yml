@@ -1,4 +1,4 @@
-name: Chess Bot Android APK — WORKFLOW FIX V6
+name: Chess Bot Android APK — WORKFLOW FIX
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ jobs:
       INCLUDE_STOCKFISH_FULL: "1"
 
     steps:
-      - name: VERIFY ACTIVE WORKFLOW — V6
+      - name: VERIFY ACTIVE WORKFLOW
         shell: bash
         run: |
           set -euo pipefail
@@ -46,14 +46,11 @@ jobs:
           if [[ -n "${INPUT_ZIP:-}" ]]; then
             ZIP_FILE="$GITHUB_WORKSPACE/$INPUT_ZIP"
           else
-            # Newest full-source ZIP in the repo root. "*patch-only*" ZIPs hold only changed
-            # files (no capacitor.config.json) and can never be built on their own.
             ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \
               \( -name 'vila-chess*.zip' -o -name 'VILA*.zip' \) \
               ! -iname '*patch-only*' -printf '%p\n' | sort -V | tail -n 1)"
           fi
 
-          # No ZIP: build the project that is already checked out at the repo root.
           if [[ -z "$ZIP_FILE" || ! -s "$ZIP_FILE" ]]; then
             if [[ -f package.json && -f capacitor.config.json ]]; then
               echo "No source ZIP found; using the repository root as the project."
@@ -132,11 +129,12 @@ jobs:
         with:
           node-version: "22"
 
+      # ĐÃ SỬA DUY NHẤT Ở ĐÂY: Đổi Java 21 thành Java 17
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "17"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -163,7 +161,6 @@ jobs:
             | xargs -0 -r -n1 node --check
           python3 -m py_compile scripts/package-android-source.py
 
-      # Tests are a required quality gate: a failure blocks APK packaging.
       - name: Run tests
         working-directory: ${{ steps.source.outputs.project_dir }}
         run: npm test
@@ -191,12 +188,9 @@ jobs:
           echo "sdk.dir=${ANDROID_HOME:-$ANDROID_SDK_ROOT}" > android/local.properties
 
           npx cap sync android
-          # Must run right after sync: installs libstockfish.so + the UCI bridge that
-          # verify-android-project.mjs and the Gradle packaging checks require.
           node scripts/install-native-stockfish-android.mjs android
           node scripts/apply-android-branding.mjs
 
-          # Hand-tracking camera permission, applied AFTER sync/branding and BEFORE verification.
           python3 - <<'PY'
           import re, pathlib, sys
           mf = pathlib.Path("android/app/src/main/AndroidManifest.xml")
@@ -290,7 +284,7 @@ jobs:
       - name: Upload verified APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Chess-Bot-debug-APK-V6
+          name: Chess-Bot-debug-APK
           path: output/*
           if-no-files-found: error
           retention-days: 14
