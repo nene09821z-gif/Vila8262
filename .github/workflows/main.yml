@@ -133,7 +133,16 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
+
+      - name: Verify JDK 21 (Capacitor 7 needs Java 21)
+        shell: bash
+        run: |
+          set -euo pipefail
+          javac -version
+          major="$(javac -version 2>&1 | sed -E 's/^javac ([0-9]+).*/\1/')"
+          if [ "$major" -lt 21 ]; then echo "::error::JDK $major found; Java 21+ required."; exit 1; fi
+          rm -f "$HOME/.gradle/gradle.properties"
 
       # ĐÃ SỬA LỖI Ở ĐÂY: Xóa chữ "tools" đi
       - name: Set up Android SDK
@@ -216,7 +225,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace assembleDebug
+          ./gradlew --no-daemon --stacktrace "-Dorg.gradle.java.home=$JAVA_HOME" assembleDebug
 
       - name: Verify APK integrity and package contents
         id: apk
@@ -288,3 +297,4 @@ jobs:
           path: output/*
           if-no-files-found: error
           retention-days: 14
+          
