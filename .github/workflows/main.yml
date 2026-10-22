@@ -135,10 +135,11 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # ĐÃ SỬA LỖI Ở ĐÂY: Xóa chữ "tools" đi
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: "tools platform-tools platforms;android-35 build-tools;35.0.0"
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
 
       - name: Download and verify native Stockfish Android ARM64
         working-directory: ${{ steps.source.outputs.project_dir }}
