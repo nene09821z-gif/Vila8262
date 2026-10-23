@@ -57,9 +57,11 @@ function constantTimeEqual(a, b) {
   for (let i = 0; i < a.length; i++) result |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return result === 0;
 }
+// Cloudflare Workers' WebCrypto rejects PBKDF2 above 100,000 iterations (it throws), so this is the maximum.
+const PBKDF2_ITERATIONS = 100_000;
 async function passwordHash(password, saltHex) {
   const key = await crypto.subtle.importKey('raw', utf8(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: fromHex(saltHex), iterations: 120_000 }, key, 256);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: fromHex(saltHex), iterations: PBKDF2_ITERATIONS }, key, 256);
   return hex(new Uint8Array(bits));
 }
 async function signToken(db, user) {
