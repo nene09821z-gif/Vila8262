@@ -1,4 +1,4 @@
-name: Chess Bot Android APK — WORKFLOW FIX V7
+name: Chess Bot Android APK — WORKFLOW FIX V9
 
 "on":
   workflow_dispatch:
@@ -293,7 +293,7 @@ jobs:
       - name: Upload verified APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Chess-Bot-debug-APK
+          name: Chess debug apk
           path: output/*
           if-no-files-found: error
           retention-days: 14
