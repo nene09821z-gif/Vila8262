@@ -25,7 +25,7 @@ jobs:
       INCLUDE_STOCKFISH_FULL: "1"
 
     steps:
-      - name: VERIFY ACTIVE WORKFLOW — V6
+      - name: VERIFY ACTIVE WORKFLOW — V9
         shell: bash
         run: |
           set -euo pipefail
@@ -293,7 +293,7 @@ jobs:
       - name: Upload verified APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Chess debug apk
+          name: Chess-debug-apk
           path: output/*
           if-no-files-found: error
           retention-days: 14
