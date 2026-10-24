@@ -1,0 +1,16 @@
+{
+  "name": "vila-chess-cloudflare-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "node --check src/index.js"
+  },
+  "dependencies": {
+    "chess.js": "1.4.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.45.0"
+  }
+}

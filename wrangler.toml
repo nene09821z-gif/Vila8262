@@ -1,0 +1,16 @@
+name = "bitter-sun-751a"
+main = "src/index.js"
+compatibility_date = "2026-10-22"
+workers_dev = true
+
+# Refund sync: revoke plans Google refunded (needs the GOOGLE_SERVICE_ACCOUNT_JSON secret).
+[triggers]
+crons = ["17 */6 * * *"]
+
+[[durable_objects.bindings]]
+name = "CHESS_STATE"
+class_name = "ChessState"
+
+[exports.ChessState]
+type = "durable-object"
+storage = "sqlite"
