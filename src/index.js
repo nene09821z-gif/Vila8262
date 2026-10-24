@@ -290,10 +290,50 @@ async function readExternalBody(request) {
     throw new Error(error?.message === 'Nội dung yêu cầu quá lớn.' ? error.message : 'Dữ liệu JSON không hợp lệ.');
   }
 }
-function withCors(response, cors) {
+const SECURITY_HEADERS = Object.freeze({
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  'Cross-Origin-Resource-Policy': 'cross-origin',
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+  'Cache-Control': 'no-store'
+});
+function withCors(response, cors = {}) {
   const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(SECURITY_HEADERS)) headers.set(key, value);
   for (const [key, value] of Object.entries(cors)) headers.set(key, value);
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+function allowedOrigins(env) {
+  // Set CORS_ORIGINS as a comma-separated list of exact origins, e.g.
+  // https://your-site.pages.dev,https://your-custom-domain.example
+  // Do not include paths or trailing slashes. Never use '*'.
+  return new Set(String(env?.CORS_ORIGINS || '')
+    .split(',').map(value => value.trim()).filter(Boolean)
+    .map(value => {
+      if (value === 'null') return 'null'; // Explicit opt-in only for opaque origins (some local WebViews).
+      try {
+        const parsed = new URL(value);
+        if (!['https:', 'http:'].includes(parsed.protocol) || parsed.origin !== value || parsed.username || parsed.password) return '';
+        if (parsed.protocol === 'http:' && !['localhost', '127.0.0.1'].includes(parsed.hostname)) return '';
+        return parsed.origin;
+      } catch { return ''; }
+    }).filter(Boolean));
+}
+function corsHeadersFor(request, env) {
+  const origin = request.headers.get('Origin');
+  const headers = {
+    'Vary': 'Origin',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+    'Access-Control-Max-Age': '600'
+  };
+  // Native/non-browser clients that send no Origin are not governed by browser CORS.
+  if (!origin) return { allowed: true, headers };
+  if (!allowedOrigins(env).has(origin)) return { allowed: false, headers };
+  headers['Access-Control-Allow-Origin'] = origin;
+  return { allowed: true, headers };
 }
 function validUciList(value) {
   const moves = asText(value, 1000).split(',').filter(Boolean).slice(0, 40);
@@ -405,17 +445,22 @@ async function externalApi(request, url) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const origin = request.headers.get('Origin') || '*';
-    const cors = { 'Access-Control-Allow-Origin': origin, 'Vary': 'Origin', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS' };
-    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+    const corsResult = corsHeadersFor(request, env);
+    const cors = corsResult.headers;
+    if (!corsResult.allowed) {
+      // Never reflect an arbitrary Origin. The request may still reach the
+      // Worker, but browsers cannot read this response and preflights fail.
+      return withCors(json({ error: 'Origin không được phép.' }, 403), cors);
+    }
+    if (request.method === 'OPTIONS') return withCors(new Response(null, { status: 204 }), cors);
     if (url.pathname === '/' || url.pathname === '/api/health') {
-      return json({ ok: true, app: 'Cờ Vua ViLa', version: '3.67.0-cloud', service: 'cloudflare-durable-object', capabilities: ['ranked-online', 'social-accounts', 'persistent-storage', 'persistent-messenger', 'admin-purchase-queue', 'support-admin-lookup', 'offline-admin-bot', 'plan-tier-badges', 'rate-limited-plan-requests', 'lichess-proxy', 'opening-explorer', 'puzzle-proxy'] }, 200, cors);
+      return withCors(json({ ok: true, app: 'Cờ Vua ViLa', version: '3.67.0-cloud', service: 'cloudflare-durable-object', capabilities: ['ranked-online', 'social-accounts', 'persistent-storage', 'persistent-messenger', 'admin-purchase-queue', 'support-admin-lookup', 'offline-admin-bot', 'plan-tier-badges', 'rate-limited-plan-requests', 'lichess-proxy', 'opening-explorer', 'puzzle-proxy'] }, 200), cors);
     }
     if (url.pathname.startsWith('/api/lichess/') || url.pathname === '/api/openings/explorer' || /^\/api\/puzzles\/(next|daily)$/.test(url.pathname)) {
       try { return withCors(await externalApi(request, url), cors); }
       catch (error) { return withCors(fail(String(error?.message || error).slice(0, 250), 500), cors); }
     }
-    if (!url.pathname.startsWith('/api/social')) return json({ error: 'Không tìm thấy API.' }, 404, cors);
+    if (!url.pathname.startsWith('/api/social')) return withCors(json({ error: 'Không tìm thấy API.' }, 404), cors);
     const id = env.CHESS_STATE.idFromName('vila-global-community-v1');
     const stub = env.CHESS_STATE.get(id);
     return withCors(await stub.fetch(request), cors);
