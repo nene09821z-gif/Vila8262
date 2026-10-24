@@ -1,7 +1,7 @@
 import { Chess } from 'chess.js';
-import { entitlementForClient, normalizeEntitlement, reviewAccess, consumeFreeReview, grantPlan, grantProTrial, grantProCodeTrial, grantPremiumCodeTrial, effectivePlan, revokePlan, refundPurchase, DAY_MS, PRO_CODE_TRIAL_DURATION_MS, PREMIUM_CODE_TRIAL_DURATION_MS } from '../../src/plans.js';
-import { RANKED_CLOCK_PRESETS } from '../../src/clock.js';
-import { createRankedFairPlayState, assessRankedFairPlayMove } from '../../src/ranked-fair-play.js';
+import { entitlementForClient, normalizeEntitlement, reviewAccess, consumeFreeReview, grantPlan, grantProTrial, grantProCodeTrial, grantPremiumCodeTrial, effectivePlan, revokePlan, refundPurchase, DAY_MS, PRO_CODE_TRIAL_DURATION_MS, PREMIUM_CODE_TRIAL_DURATION_MS } from './plans.js';
+import { RANKED_CLOCK_PRESETS } from './clock.js';
+import { createRankedFairPlayState, assessRankedFairPlayMove } from './ranked-fair-play.js';
 import { BillingError, billingConfigured, billingProducts, planForProduct, accountBindingId, sha256Hex, lookupPurchase, acknowledgePurchase, listVoidedPurchases } from './billing.js';
 
 const TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
