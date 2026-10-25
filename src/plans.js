@@ -6,7 +6,7 @@
  *  - premium : full review access for life
  *
  * An entitlement is plain JSON: { plan, proExpiresAt, premium, freeReviewsUsed, freeReviewGameId }.
- * Money never changes engine strength or Elo (see MONETIZATION.md); plans only unlock review/analysis access.
+ * Money never changes engine strength or Elo (see docs/guides/MONETIZATION.md); plans only unlock review/analysis access.
  */
 export const DAY_MS = 24 * 60 * 60 * 1000;
 export const PRO_DURATION_DAYS = 365;

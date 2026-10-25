@@ -1,7 +1,7 @@
 import { Chess } from 'chess.js';
 import { entitlementForClient, normalizeEntitlement, reviewAccess, consumeFreeReview, grantPlan, grantProTrial, grantProCodeTrial, grantPremiumCodeTrial, effectivePlan, revokePlan, refundPurchase, DAY_MS, PRO_CODE_TRIAL_DURATION_MS, PREMIUM_CODE_TRIAL_DURATION_MS } from './plans.js';
 import { RANKED_CLOCK_PRESETS } from './clock.js';
-import { createRankedFairPlayState, assessRankedFairPlayMove } from './ranked-fair-play.js';
+import { createRankedFairPlayState, assessRankedFairPlayMove, assessRankedFocusSignal } from './ranked-fair-play.js';
 import { BillingError, billingConfigured, billingProducts, planForProduct, accountBindingId, sha256Hex, lookupPurchase, acknowledgePurchase, listVoidedPurchases } from './billing.js';
 
 const TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -9,6 +9,62 @@ const TOKEN_REFRESH_AFTER_SECONDS = 7 * 24 * 60 * 60;
 const MIN_PASSWORD_LENGTH = 8;
 const USERNAME_RE = /^[a-zA-Z0-9_.-]{3,24}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_JSON_BODY_BYTES = 65_536;
+const DEFAULT_ALLOWED_ORIGINS = Object.freeze([
+  'https://localhost', 'capacitor://localhost', 'ionic://localhost'
+]);
+// Best-effort per-isolate throttling for proxy routes. Durable social endpoints also
+// have persistent rate limits in ChessState; production should add Cloudflare WAF rules.
+const edgeRateBuckets = new Map();
+const SECURITY_HEADERS = Object.freeze({
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'X-Permitted-Cross-Domain-Policies': 'none',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  'Content-Security-Policy': "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+});
+function corsPolicy(request, env = {}) {
+  const configured = typeof env.CORS_ORIGINS === 'string' ? env.CORS_ORIGINS.split(',').map(value => value.trim()).filter(Boolean) : [];
+  const allowed = new Set([...DEFAULT_ALLOWED_ORIGINS, ...configured]);
+  const origin = request.headers.get('Origin') || '';
+  const headers = { Vary: 'Origin' };
+  if (!origin) return { allowed: true, headers };
+  if (!allowed.has(origin)) return { allowed: false, headers };
+  Object.assign(headers, {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+    'Access-Control-Max-Age': '600'
+  });
+  return { allowed: true, headers };
+}
+function secureResponse(response, corsHeaders = {}, request = null) {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(SECURITY_HEADERS)) headers.set(key, value);
+  headers.set('Cache-Control', headers.get('Cache-Control') || 'no-store');
+  for (const [key, value] of Object.entries(corsHeaders)) headers.set(key, value);
+  try { if (request && new URL(request.url).protocol === 'https:') headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains'); } catch {}
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+function edgeRateLimit(request, path) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const policy = path.startsWith('/api/lichess/') ? ['lichess-proxy', 20, 60_000]
+    : path === '/api/openings/explorer' ? ['opening-proxy', 30, 60_000]
+    : path.startsWith('/api/puzzles/') ? ['puzzle-proxy', 30, 60_000] : ['external-proxy', 80, 60_000];
+  const [name, maximum, windowMs] = policy;
+  const key = `${name}:${ip}`;
+  const now = Date.now();
+  const recent = (edgeRateBuckets.get(key) || []).filter(timestamp => now - timestamp < windowMs);
+  if (recent.length >= maximum) return Math.max(1, Math.ceil((windowMs - (now - recent[0])) / 1000));
+  recent.push(now);
+  edgeRateBuckets.set(key, recent);
+  if (edgeRateBuckets.size > 5000) {
+    for (const [bucket, hits] of edgeRateBuckets) if (!hits.length || now - hits[hits.length - 1] > 3_600_000) edgeRateBuckets.delete(bucket);
+    while (edgeRateBuckets.size > 5000) edgeRateBuckets.delete(edgeRateBuckets.keys().next().value);
+  }
+  return 0;
+}
 // One canonical clock catalogue shared with the UI and Node backend so no
 // visible preset can be offered by the client and rejected by the Worker.
 const CONTROLS = Object.freeze(Object.fromEntries(RANKED_CLOCK_PRESETS.map(preset => [preset.value, {
@@ -67,7 +123,9 @@ async function signToken(db, user) {
 }
 async function verifyToken(db, token) {
   try {
-    const parts = String(token || '').split('.');
+    const tokenText = String(token || '');
+    if (!tokenText || tokenText.length > 4096) return null;
+    const parts = tokenText.split('.');
     if (parts.length !== 2) return null;
     const key = await crypto.subtle.importKey('raw', decodeB64url(db.tokenSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
     const valid = await crypto.subtle.verify('HMAC', key, decodeB64url(parts[1]), utf8(parts[0]));
@@ -219,7 +277,41 @@ function audit(db, actor, action, target = '', detail = '') {
   db.audit.push({ id: crypto.randomUUID(), at: nowIso(), actor: actor || 'system', action, target: String(target).slice(0, 100), detail: String(detail).slice(0, 300), source: 'cloudflare-worker' });
   db.audit = db.audit.slice(-2000);
 }
-function readRouteBody(request) { return request.text().then(raw => { if (!raw) return {}; if (raw.length > 65_536) throw new Error('Nội dung yêu cầu quá lớn.'); try { return JSON.parse(raw); } catch { throw new Error('Dữ liệu JSON không hợp lệ.'); } }); }
+async function readBoundedText(request) {
+  const contentLength = request.headers.get('Content-Length');
+  const declaredLength = contentLength === null ? NaN : Number(contentLength);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_JSON_BODY_BYTES) throw new Error('Nội dung yêu cầu quá lớn.');
+  if (!request.body) return '';
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      // Cancel as soon as the streamed byte count crosses the cap; do not buffer
+      // an unbounded body just because Content-Length is missing or misleading.
+      if (total > MAX_JSON_BODY_BYTES) {
+        try { await reader.cancel(); } catch {}
+        throw new Error('Nội dung yêu cầu quá lớn.');
+      }
+      chunks.push(value);
+    }
+  } finally { try { reader.releaseLock(); } catch {} }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(bytes);
+}
+async function readRouteBody(request) {
+  const raw = await readBoundedText(request);
+  if (!raw) return {};
+  let value;
+  try { value = JSON.parse(raw); } catch { throw new Error('Dữ liệu JSON không hợp lệ.'); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Dữ liệu JSON phải là một đối tượng.');
+  return value;
+}
 
 function recordsFromDb(db) {
   const records = new Map();
@@ -282,58 +374,17 @@ function dbFromRecords(rows) {
 
 async function readExternalBody(request) {
   try {
-    const raw = await request.text();
+    const raw = await readBoundedText(request);
     if (!raw) return {};
-    if (raw.length > 65_536) throw new Error('Nội dung yêu cầu quá lớn.');
-    return JSON.parse(raw);
+    const value = JSON.parse(raw);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Dữ liệu JSON phải là một đối tượng.');
+    return value;
   } catch (error) {
     throw new Error(error?.message === 'Nội dung yêu cầu quá lớn.' ? error.message : 'Dữ liệu JSON không hợp lệ.');
   }
 }
-const SECURITY_HEADERS = Object.freeze({
-  'X-Content-Type-Options': 'nosniff',
-  'X-Frame-Options': 'DENY',
-  'Referrer-Policy': 'no-referrer',
-  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
-  'Cross-Origin-Resource-Policy': 'cross-origin',
-  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
-  'Cache-Control': 'no-store'
-});
-function withCors(response, cors = {}) {
-  const headers = new Headers(response.headers);
-  for (const [key, value] of Object.entries(SECURITY_HEADERS)) headers.set(key, value);
-  for (const [key, value] of Object.entries(cors)) headers.set(key, value);
-  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
-}
-function allowedOrigins(env) {
-  // Set CORS_ORIGINS as a comma-separated list of exact origins, e.g.
-  // https://your-site.pages.dev,https://your-custom-domain.example
-  // Do not include paths or trailing slashes. Never use '*'.
-  return new Set(String(env?.CORS_ORIGINS || '')
-    .split(',').map(value => value.trim()).filter(Boolean)
-    .map(value => {
-      if (value === 'null') return 'null'; // Explicit opt-in only for opaque origins (some local WebViews).
-      try {
-        const parsed = new URL(value);
-        if (!['https:', 'http:'].includes(parsed.protocol) || parsed.origin !== value || parsed.username || parsed.password) return '';
-        if (parsed.protocol === 'http:' && !['localhost', '127.0.0.1'].includes(parsed.hostname)) return '';
-        return parsed.origin;
-      } catch { return ''; }
-    }).filter(Boolean));
-}
-function corsHeadersFor(request, env) {
-  const origin = request.headers.get('Origin');
-  const headers = {
-    'Vary': 'Origin',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-    'Access-Control-Max-Age': '600'
-  };
-  // Native/non-browser clients that send no Origin are not governed by browser CORS.
-  if (!origin) return { allowed: true, headers };
-  if (!allowedOrigins(env).has(origin)) return { allowed: false, headers };
-  headers['Access-Control-Allow-Origin'] = origin;
-  return { allowed: true, headers };
+function withCors(response, cors, request) {
+  return secureResponse(response, cors, request);
 }
 function validUciList(value) {
   const moves = asText(value, 1000).split(',').filter(Boolean).slice(0, 40);
@@ -351,7 +402,7 @@ async function externalApi(request, url) {
     upstreamUrl.searchParams.set('ratings[]', '1600');
     upstreamUrl.searchParams.set('moves', moves.join(','));
     try {
-      const upstream = await fetch(upstreamUrl, { headers: { Accept: 'application/json', 'User-Agent': 'ViLa-Chess/3.67.0' }, signal: AbortSignal.timeout(20_000) });
+      const upstream = await fetch(upstreamUrl, { headers: { Accept: 'application/json', 'User-Agent': 'ViLa-Chess/3.68.1' }, signal: AbortSignal.timeout(20_000) });
       const raw = await upstream.text();
       let data = {};
       try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
@@ -366,7 +417,7 @@ async function externalApi(request, url) {
     const difficulty = ['easiest', 'easier', 'normal', 'harder', 'hardest'].includes(bandValue) ? bandValue : 'normal';
     const upstreamUrl = daily ? 'https://lichess.org/api/puzzle/daily' : `https://lichess.org/api/puzzle/next?difficulty=${encodeURIComponent(difficulty)}`;
     try {
-      const upstream = await fetch(upstreamUrl, { headers: { Accept: 'application/json', 'User-Agent': 'ViLa-Chess/3.67.0 puzzle-proxy' }, signal: AbortSignal.timeout(12_000) });
+      const upstream = await fetch(upstreamUrl, { headers: { Accept: 'application/json', 'User-Agent': 'ViLa-Chess/3.68.1 puzzle-proxy' }, signal: AbortSignal.timeout(12_000) });
       const raw = await upstream.text();
       let data = {};
       try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
@@ -445,25 +496,31 @@ async function externalApi(request, url) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const corsResult = corsHeadersFor(request, env);
-    const cors = corsResult.headers;
-    if (!corsResult.allowed) {
-      // Never reflect an arbitrary Origin. The request may still reach the
-      // Worker, but browsers cannot read this response and preflights fail.
-      return withCors(json({ error: 'Origin không được phép.' }, 403), cors);
+    const corsPolicyResult = corsPolicy(request, env);
+    const cors = corsPolicyResult.headers;
+    if (request.method === 'OPTIONS') {
+      if (!corsPolicyResult.allowed) return secureResponse(fail('Origin chưa được cho phép.', 403), cors, request);
+      return secureResponse(new Response(null, { status: 204 }), cors, request);
     }
-    if (request.method === 'OPTIONS') return withCors(new Response(null, { status: 204 }), cors);
+    if (request.headers.has('Origin') && !corsPolicyResult.allowed) {
+      // Reject disallowed browser origins early. Non-browser clients without Origin remain supported.
+      return secureResponse(fail('Origin chưa được cho phép.', 403), cors, request);
+    }
     if (url.pathname === '/' || url.pathname === '/api/health') {
-      return withCors(json({ ok: true, app: 'Cờ Vua ViLa', version: '3.67.0-cloud', service: 'cloudflare-durable-object', capabilities: ['ranked-online', 'social-accounts', 'persistent-storage', 'persistent-messenger', 'admin-purchase-queue', 'support-admin-lookup', 'offline-admin-bot', 'plan-tier-badges', 'rate-limited-plan-requests', 'lichess-proxy', 'opening-explorer', 'puzzle-proxy'] }, 200), cors);
+      return secureResponse(json({ ok: true, app: 'Cờ Vua ViLa', version: '3.68.1-secure-patch', service: 'cloudflare-durable-object', capabilities: ['ranked-online', 'social-accounts', 'persistent-storage', 'persistent-messenger', 'admin-purchase-queue', 'support-admin-lookup', 'offline-admin-bot', 'plan-tier-badges', 'rate-limited-plan-requests', 'server-authoritative-chess', 'session-revocation', 'security-headers', 'origin-allowlist', 'abuse-rate-limits', 'lichess-proxy', 'opening-explorer', 'puzzle-proxy'] }, 200), cors, request);
     }
-    if (url.pathname.startsWith('/api/lichess/') || url.pathname === '/api/openings/explorer' || /^\/api\/puzzles\/(next|daily)$/.test(url.pathname)) {
-      try { return withCors(await externalApi(request, url), cors); }
-      catch (error) { return withCors(fail(String(error?.message || error).slice(0, 250), 500), cors); }
+    const isExternalProxy = url.pathname.startsWith('/api/lichess/') || url.pathname === '/api/openings/explorer' || /^\/api\/puzzles\/(next|daily)$/.test(url.pathname);
+    if (isExternalProxy) {
+      const retryAfter = edgeRateLimit(request, url.pathname);
+      if (retryAfter) return secureResponse(json({ error: 'Quá nhiều yêu cầu tới dịch vụ tích hợp. Hãy thử lại sau.', retryAfterSeconds: retryAfter }, 429, { 'Retry-After': String(retryAfter) }), cors, request);
+      try { return withCors(await externalApi(request, url), cors, request); }
+      catch (error) { return withCors(fail('Dịch vụ tích hợp gặp lỗi nội bộ.', 500), cors, request); }
     }
-    if (!url.pathname.startsWith('/api/social')) return withCors(json({ error: 'Không tìm thấy API.' }, 404), cors);
+    if (!url.pathname.startsWith('/api/social')) return secureResponse(json({ error: 'Không tìm thấy API.' }, 404), cors, request);
+    if (!env?.CHESS_STATE) return secureResponse(json({ error: 'Máy chủ cộng đồng chưa được cấu hình.', code: 'BACKEND_NOT_CONFIGURED' }, 503), cors, request);
     const id = env.CHESS_STATE.idFromName('vila-global-community-v1');
     const stub = env.CHESS_STATE.get(id);
-    return withCors(await stub.fetch(request), cors);
+    return withCors(await stub.fetch(request), cors, request);
   },
   /** Cron (see wrangler.toml): revoke plans for purchases Google has refunded. */
   async scheduled(_event, env) {
@@ -530,6 +587,14 @@ export class ChessState {
   }
   async handle(request) {
     await this.ready;
+    // Secrets added after this Durable Object was already running are only visible via this.env now:
+    // create the admin lazily (at most every 15 s) instead of waiting for the next cold start.
+    if (!this.db.users.some(item => item.role === 'admin') && this.env.ADMIN_USERNAME && this.env.ADMIN_PASSWORD && Date.now() - (this.lastAdminBootstrapTry || 0) > 15_000) {
+      this.lastAdminBootstrapTry = Date.now();
+      const beforeBootstrap = recordsFromDb(this.db);
+      await this.bootstrapAdmin();
+      await this.commitDiff(beforeBootstrap, recordsFromDb(this.db));
+    }
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
     const path = url.pathname.startsWith('/api/social') ? (url.pathname.slice('/api/social'.length) || '/') : url.pathname;
@@ -553,7 +618,8 @@ export class ChessState {
     try {
       response = await this.route({ method, path, params, query: url.searchParams, body, user, auth, token, internal: !url.pathname.startsWith('/api/social') });
     } catch (error) {
-      response = fail(String(error?.message || error || 'Lỗi máy chủ.').slice(0, 300), 500);
+      console.error('[VILA security] Unhandled backend route error:', String(error?.message || error).slice(0, 240));
+      response = fail('Lỗi máy chủ nội bộ. Vui lòng thử lại sau.', 500);
     }
     await this.commitDiff(before, recordsFromDb(this.db));
     return response;
@@ -563,6 +629,9 @@ export class ChessState {
     const policies = [['all', 300, 60_000]];
     if (method === 'POST' && path === '/auth/register') policies.push(['register', 20, 3_600_000]);
     if (method === 'POST' && path === '/auth/login') policies.push(['login', 40, 900_000]);
+    if (method === 'POST' && path === '/auth/forgot-password') policies.push(['password-recovery', 8, 3_600_000]);
+    if (method === 'POST' && path === '/auth/reset-password') policies.push(['password-reset', 8, 900_000]);
+    if (method === 'PATCH' && path === '/account/password') policies.push(['password-change', 8, 900_000]);
     if (method === 'PATCH' && path.startsWith('/account/')) policies.push(['account', 15, 900_000]);
     if (method === 'POST' && path.startsWith('/messages/')) policies.push(['direct-message', 40, 60_000]);
     if (method === 'POST' && path === '/me/purchase-requests') policies.push(['purchase-request', 8, 3_600_000]);
@@ -580,6 +649,11 @@ export class ChessState {
     for (const entry of Object.keys(this.db.rateLimits)) {
       const hits = this.db.rateLimits[entry];
       if (!Array.isArray(hits) || !hits.length || now - hits[hits.length - 1] > 3_600_000) delete this.db.rateLimits[entry];
+    }
+    const limitEntries = Object.entries(this.db.rateLimits);
+    if (limitEntries.length > 10_000) {
+      limitEntries.sort((a, b) => (Number(a[1]?.[a[1].length - 1]) || 0) - (Number(b[1]?.[b[1].length - 1]) || 0));
+      for (const [key] of limitEntries.slice(0, limitEntries.length - 8_000)) delete this.db.rateLimits[key];
     }
     return '';
   }
@@ -614,10 +688,28 @@ export class ChessState {
       const identity = asText(body.username || body.identity, 254).toLowerCase();
       const password = String(body.password || '');
       if (!identity || !password || password.length > 256) return fail('Nhập tên đăng nhập và mật khẩu.');
+      // Account-keyed limit complements the per-IP limiter and makes distributed password guessing slower.
+      const identityBucket = `identity-login:${await sha256Hex(identity)}`;
+      const now = Date.now();
+      const previousAttempts = (Array.isArray(this.db.rateLimits[identityBucket]) ? this.db.rateLimits[identityBucket] : []).filter(time => now - time < 15 * 60_000);
+      // Do not lock a real account merely because someone knows its username. Verify
+      // the credential first; only failed attempts are throttled. IP limits still apply.
+      const identityThrottled = previousAttempts.length >= 10;
       const found = this.db.users.find(item => item.username.toLowerCase() === identity || (item.email && item.email.toLowerCase() === identity) || String(item.displayName || '').toLowerCase() === identity);
       const dummySalt = '00112233445566778899aabbccddeeff';
       const candidate = await passwordHash(password, found?.salt || dummySalt);
-      if (!found || !constantTimeEqual(candidate, found.passwordHash || '')) { audit(this.db, 'anonymous', 'login_failed', identity, 'invalid credentials'); return fail('Tên đăng nhập/email hoặc mật khẩu không đúng.', 401); }
+      if (!found || !constantTimeEqual(candidate, found.passwordHash || '')) {
+        if (identityThrottled) {
+          audit(this.db, 'system', 'login_identity_throttled', identityBucket.slice(-16), 'additional failed attempt blocked; identity hash prefix only');
+          return json({ error: 'Quá nhiều lần thử đăng nhập cho tài khoản này. Hãy thử lại sau 15 phút.' }, 429, { 'Retry-After': '900' });
+        }
+        previousAttempts.push(now);
+        this.db.rateLimits[identityBucket] = previousAttempts;
+        audit(this.db, 'anonymous', 'login_failed', identityBucket.slice(-16), 'invalid credentials; identity hash prefix only');
+        if (previousAttempts.length >= 10) return json({ error: 'Quá nhiều lần thử đăng nhập cho tài khoản này. Hãy thử lại sau 15 phút.' }, 429, { 'Retry-After': '900' });
+        return fail('Tên đăng nhập/email hoặc mật khẩu không đúng.', 401);
+      }
+      delete this.db.rateLimits[identityBucket];
       if (found.banned) return fail('Tài khoản đã bị khóa. Liên hệ quản trị viên để khiếu nại.', 403);
       found.lastSeenAt = nowIso(); audit(this.db, found.id, 'login_success', found.id, 'password login');
       return json({ token: await signToken(this.db, found), user: selfUser(found) });
@@ -909,6 +1001,40 @@ export class ChessState {
       return json({ request: { id: request.id, plan: request.plan, amountVnd: request.amountVnd, status: request.status, reviewedAt: request.reviewedAt }, user: { ...publicUser(target), entitlement: entitlementForClient(target.entitlement) }, message: responseText });
     }
 
+    if (method === 'GET' && path === '/admin/revenue') {
+      const required = this.needUser(user); if (required) return required;
+      if (user.role !== 'admin') return fail('Bạn không có quyền quản trị.', 403);
+      // Revenue = purchase requests an admin confirmed as paid (approved). Pending items are shown separately and never counted.
+      const requests = this.db.purchaseRequests || [];
+      const approved = requests.filter(item => item.status === 'approved');
+      const stamp = item => Date.parse(item.reviewedAt || item.createdAt) || 0;
+      const vnd = item => Math.max(0, Number(item.amountVnd) || 0);
+      const sum = items => items.reduce((total, item) => total + vnd(item), 0);
+      const now = Date.now();
+      const within = ms => approved.filter(item => now - stamp(item) < ms);
+      const byDay = [];
+      for (let offset = 13; offset >= 0; offset -= 1) {
+        const day = new Date(now - offset * DAY_MS).toISOString().slice(0, 10);
+        const items = approved.filter(item => new Date(stamp(item)).toISOString().slice(0, 10) === day);
+        byDay.push({ date: day, vnd: sum(items), count: items.length });
+      }
+      const byPlan = {};
+      for (const item of approved) { const key = item.plan || 'other'; byPlan[key] = byPlan[key] || { count: 0, vnd: 0 }; byPlan[key].count += 1; byPlan[key].vnd += vnd(item); }
+      const play = (this.db.purchases || []).filter(item => item.status === 'granted');
+      const playByPlan = {};
+      for (const item of play) { const key = item.plan || 'other'; playByPlan[key] = (playByPlan[key] || 0) + 1; }
+      const playPrice = { pro: Number(this.env?.PLAY_PRICE_VND_PRO) || 0, premium: Number(this.env?.PLAY_PRICE_VND_PREMIUM) || 0 };
+      const playEstimateVnd = play.reduce((total, item) => total + (Number(item.priceVnd) || playPrice[item.plan] || 0), 0);
+      const pending = requests.filter(item => item.status === 'pending' && item.kind !== 'premium_inquiry');
+      return json({
+        currency: 'VND',
+        totals: { today: sum(within(DAY_MS)), week: sum(within(7 * DAY_MS)), month: sum(within(30 * DAY_MS)), all: sum(approved) },
+        counts: { approved: approved.length, payingUsers: new Set(approved.map(item => item.userId)).size, pending: pending.length, pendingVnd: sum(pending) },
+        byPlan, byDay,
+        googlePlay: { purchases: play.length, byPlan: playByPlan, estimateVnd: playEstimateVnd, priceConfigured: playEstimateVnd > 0 || (!play.length && (playPrice.pro > 0 || playPrice.premium > 0)) },
+        note: 'Doanh thu thủ công = các yêu cầu admin đã xác nhận. Google Play chỉ ước tính khi đặt biến PLAY_PRICE_VND_PRO / PLAY_PRICE_VND_PREMIUM.'
+      });
+    }
     if (method === 'GET' && path === '/admin/overview') {
       const required = this.needUser(user); if (required) return required;
       if (user.role !== 'admin') return fail('Bạn không có quyền quản trị.', 403);
@@ -1074,7 +1200,7 @@ export class ChessState {
     if (!constantTimeEqual(info.accountId, await accountBindingId(user.id))) { audit(this.db, user.id, 'purchase_account_mismatch', id.slice(0, 12), productId); return fail('Giao dịch này không thuộc tài khoản đang đăng nhập.', 403); }
     if (info.orderId && this.db.purchases.some(item => item.orderId === info.orderId)) return fail('Giao dịch này đã được ghi nhận.', 409);
     user.entitlement = grantPlan(normalizeEntitlement(user.entitlement), plan);
-    this.db.purchases.push({ id, userId: user.id, productId, plan, orderId: info.orderId, status: 'granted', grantedAt: nowIso(), purchaseTimeMillis: info.purchaseTimeMillis });
+    this.db.purchases.push({ id, userId: user.id, productId, plan, orderId: info.orderId, status: 'granted', grantedAt: nowIso(), purchaseTimeMillis: info.purchaseTimeMillis, priceVnd: Number(plan === 'premium' ? this.env?.PLAY_PRICE_VND_PREMIUM : this.env?.PLAY_PRICE_VND_PRO) || 0 });
     audit(this.db, user.id, 'purchase_granted', id.slice(0, 12), `${plan}; order=${info.orderId}`);
     if (!info.acknowledged) {
       let acked = false;
@@ -1183,7 +1309,9 @@ export class ChessState {
     match.fairPlaySignals = match.fairPlaySignals && typeof match.fairPlaySignals === 'object' ? match.fairPlaySignals : {};
     const signal = match.fairPlaySignals[user.id] || (match.fairPlaySignals[user.id] = createRankedFairPlayState());
     const fairPlay = assessRankedFairPlayMove(signal, { userId: user.id, turnDurationMs, legalMoveCount, ply: (match.moves || []).length, now: moveAt });
-    match.fairPlaySignals[user.id] = fairPlay.state;
+    const focusCheck = assessRankedFocusSignal(fairPlay.state, { userId: user.id, focusLostMs: body.focusLostMs, focusCount: body.focusCount, turnDurationMs, legalMoveCount, ply: (match.moves || []).length, now: moveAt });
+    match.fairPlaySignals[user.id] = focusCheck.state;
+    fairPlay.events.push(...focusCheck.events);
     match.fairPlayEvents = Array.isArray(match.fairPlayEvents) ? match.fairPlayEvents : [];
     for (const event of fairPlay.events) {
       if (match.fairPlayEvents.length < 100) match.fairPlayEvents.push(event);

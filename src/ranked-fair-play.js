@@ -98,3 +98,41 @@ export function assessRankedFairPlayMove(state, {
   result.level = result.signals >= 3 ? 'priority_review' : result.signals > 0 ? 'review' : 'clear';
   return { state: result, events };
 }
+
+
+const FOCUS_MIN_LOST_MS = 3000;
+const FOCUS_MIN_SHARE = 0.5;
+const FOCUS_MIN_LEGAL_MOVES = 20;
+const FOCUS_COOLDOWN_PLIES = 6;
+
+/**
+ * Weak, client-reported signal: how long the app was in the background while it was the player's turn.
+ * It only ever produces a manual-review event after it recurs on complex positions; it never decides anything
+ * by itself because a client can lie (or simply have answered a phone call).
+ */
+export function assessRankedFocusSignal(state, { userId = '', focusLostMs = 0, focusCount = 0, turnDurationMs = 0, legalMoveCount = 0, ply = 0, now = Date.now() } = {}) {
+  const result = state && typeof state === 'object' ? state : createRankedFairPlayState();
+  const duration = finiteNonNegative(turnDurationMs);
+  // Never trust a value larger than the server-measured turn.
+  const lost = Math.min(finiteNonNegative(focusLostMs), duration);
+  const count = Math.min(finiteNonNegative(focusCount), 50);
+  const branching = Math.floor(finiteNonNegative(legalMoveCount));
+  const currentPly = Math.floor(finiteNonNegative(ply));
+  result.focusLossTurns = finiteNonNegative(result.focusLossTurns);
+  result.lastFocusSignalPly = Number.isFinite(Number(result.lastFocusSignalPly)) ? Number(result.lastFocusSignalPly) : -1000;
+  const events = [];
+  const suspicious = count > 0 && lost >= FOCUS_MIN_LOST_MS && duration > 0 && lost / duration >= FOCUS_MIN_SHARE && branching >= FOCUS_MIN_LEGAL_MOVES;
+  if (suspicious) {
+    result.focusLossTurns += 1;
+    if (result.focusLossTurns >= 3 && currentPly - result.lastFocusSignalPly >= FOCUS_COOLDOWN_PLIES) {
+      result.lastFocusSignalPly = currentPly;
+      result.signals = finiteNonNegative(result.signals) + 1;
+      events.push({
+        userId, type: 'repeated_focus_loss_on_complex_turns', severity: result.focusLossTurns >= 6 ? 'priority_review' : 'review',
+        turnDurationMs: duration, legalMoveCount: branching, at: new Date(Number.isFinite(Number(now)) ? Number(now) : Date.now()).toISOString(), ply: currentPly,
+        detail: `${result.focusLossTurns} complex turns spent mostly outside the app (client-reported, low confidence)`
+      });
+    }
+  }
+  return { state: result, events };
+}
