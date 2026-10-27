@@ -1,10 +1,14 @@
-name: Chess Bot Android APK — WORKFLOW FIX V68.2
+name: Chess Bot Android APK — WORKFLOW V70.0
 
 "on":
   workflow_dispatch:
     inputs:
       source_zip:
         description: "Tên file ZIP nguồn ở thư mục gốc repo (để trống = tự chọn ZIP vila-chess*.zip mới nhất, bỏ qua *patch-only*)"
+        required: false
+        default: ""
+      puzzle_pack_max:
+        description: "Số câu đố tối đa đưa vào APK (từ cơ sở dữ liệu Lichess CC0). Để trống = 1000000"
         required: false
         default: ""
   push:
@@ -20,16 +24,16 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 75
     env:
       INCLUDE_STOCKFISH_FULL: "1"
 
     steps:
-      - name: VERIFY ACTIVE WORKFLOW — V68.2
+      - name: VERIFY ACTIVE WORKFLOW — V70.0
         shell: bash
         run: |
           set -euo pipefail
-          echo "WORKFLOW_REVISION=chess-android-v6-native-stockfish-2026-10-22"
+          echo "WORKFLOW_REVISION=chess-android-v70-chesscom-pages-puzzle-pack-2026-10-27"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -144,7 +148,7 @@ jobs:
           if [ "$major" -lt 21 ]; then echo "::error::JDK $major found; Java 21+ required."; exit 1; fi
           rm -f "$HOME/.gradle/gradle.properties"
 
-      # ĐÃ SỬA LỖI Ở ĐÂY: Xóa chữ "tools" đi
+      # Không liệt kê "tools" (gói đã lỗi thời, sdkmanager báo "Failed to find package tools").
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -170,9 +174,91 @@ jobs:
             | xargs -0 -r -n1 node --check
           python3 -m py_compile scripts/package-android-source.py
 
-      - name: Run tests
+      # Bắt lỗi lệch phiên bản, import Worker hỏng, CRLF và gói CSS cũ TRƯỚC khi mất công build APK.
+      - name: Release sync check (versions, Worker imports, line endings, CSS bundle)
         working-directory: ${{ steps.source.outputs.project_dir }}
-        run: npm test
+        run: node scripts/check-sync.mjs
+
+      - name: Require Stockfish 19 Full NNUE, Lite, ASM-JS and Stockfish 10 opponent assets
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s public/engine/stockfish-19-single.js
+          test -s public/engine/stockfish-19-single.wasm
+          test -s public/engine/stockfish-19-lite-single.js
+          test -s public/engine/stockfish-19-lite-single.wasm
+          test -s public/engine/stockfish-19-asm.js
+          test -s public/engine/stockfish-10.js
+          test -s public/engine/STOCKFISH-10-LICENSE.txt
+          node -e "const m=require('./public/engine/engine-manifest.json'); if(!m.full || !m.sf10 || m.sf10Version !== '10.0.2') process.exit(1)"
+          echo 'Stockfish 19 Full NNUE, Lite, ASM-JS and Stockfish 10 opponent assets are present.'
+
+      - name: Verify offline engine assets and release manifest
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: node scripts/verify-engine-assets.mjs --release --skip-smoke
+
+      # Kiểm thử là cổng chất lượng bắt buộc: lỗi sẽ chặn việc đóng gói APK.
+      - name: Run tests
+        id: tests
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: npm test -- --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap --test-reporter-destination=test-report.tap
+
+      - name: Show failed tests on the run summary page
+        if: always() && steps.tests.outcome == 'failure'
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          {
+            echo '### Tests failed (APK build halted)'
+            echo 'Copy the block below and send it for fixing:'
+            echo '```'
+            grep -E '^[[:space:]]*not ok' test-report.tap | head -40 || true
+            echo '```'
+            echo 'Error details:'
+            echo '```'
+            grep -E "error:|Cannot find|ERR_|expected|actual|AssertionError" test-report.tap | head -40 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo '::error title=Tests failed::APK build halted. Open the run Summary page to see which tests failed.'
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: ${{ steps.source.outputs.project_dir }}/test-report.tap
+          if-no-files-found: ignore
+
+      # Kho tích hợp trong ZIP chỉ có ~1.700 câu. Bước này thay bằng cơ sở dữ liệu câu đố Lichess (CC0, ~5 triệu câu)
+      # ngay trên máy chủ build (có internet). Bộ lọc nới lỏng để lấy được NHIỀU câu nhất; mỗi câu vẫn được app
+      # kiểm tra lại từng nước bằng luật cờ trước khi hiển thị. Không bao giờ làm hỏng build: nếu tải/chuyển đổi lỗi
+      # thì giữ nguyên kho nhỏ đi kèm và in cảnh báo.
+      - name: Build full Lichess puzzle pack (up to 1,000,000 puzzles, sharded by rating)
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        env:
+          PUZZLE_PACK_MAX_INPUT: ${{ inputs.puzzle_pack_max }}
+          PUZZLE_PACK_MAX_VAR: ${{ vars.PUZZLE_PACK_MAX }}
+        run: |
+          set +e
+          MAX="${PUZZLE_PACK_MAX_INPUT:-${PUZZLE_PACK_MAX_VAR:-1000000}}"
+          case "$MAX" in ''|*[!0-9]*) MAX=1000000 ;; esac
+          sudo apt-get install -y zstd >/dev/null 2>&1
+          if curl -fL --retry 4 --retry-delay 5 --max-time 1500 -o /tmp/lichess_db_puzzle.csv.zst https://database.lichess.org/lichess_db_puzzle.csv.zst; then
+            node --max-old-space-size=6144 scripts/build-puzzle-pack.mjs /tmp/lichess_db_puzzle.csv.zst \
+                --max "$MAX" --shard-size 1500 \
+                --min-popularity 70 --min-plays 300 --max-deviation 110 --max-plies 12 \
+                --out /tmp/puzzle-pack \
+              && test -s /tmp/puzzle-pack/index.json \
+              && rm -rf public/puzzles && cp -r /tmp/puzzle-pack public/puzzles \
+              && echo "Full puzzle pack installed: $(node -e "console.log(JSON.parse(require('fs').readFileSync('public/puzzles/index.json','utf8')).total)") puzzles, $(du -sh public/puzzles | cut -f1)" \
+              && echo "### Puzzle pack: $(node -e "console.log(JSON.parse(require('fs').readFileSync('public/puzzles/index.json','utf8')).total)") puzzles ($(du -sh public/puzzles | cut -f1))" >> "$GITHUB_STEP_SUMMARY" \
+              || echo "::warning title=Puzzle pack::Conversion failed; the bundled pack is kept."
+          else
+            echo "::warning title=Puzzle pack::Could not download the Lichess puzzle database; the bundled pack is kept."
+          fi
+          exit 0
 
       - name: Build web assets
         working-directory: ${{ steps.source.outputs.project_dir }}
@@ -182,6 +268,10 @@ jobs:
           REQUIRE_OPENING_CATALOG: "1"
           REQUIRE_PIECE_SETS: "1"
         run: npm run build
+
+      - name: Verify complete ECO catalog was copied into the production build
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: node scripts/verify-opening-catalog.mjs
 
       - name: Generate, brand, and verify Android project
         working-directory: ${{ steps.source.outputs.project_dir }}
@@ -219,6 +309,7 @@ jobs:
           PY
           node scripts/ensure-camera-permission.mjs android
           node scripts/verify-android-project.mjs
+          python3 scripts/package-android-source.py "$RUNNER_TEMP/covua-vila-android-gradle-source.zip"
 
       - name: Build debug APK
         working-directory: ${{ steps.source.outputs.project_dir }}/android
@@ -275,10 +366,15 @@ jobs:
               if "lib/arm64-v8a/libstockfish.so" not in names:
                   raise SystemExit("APK is missing lib/arm64-v8a/libstockfish.so (native Stockfish)")
 
+              if "assets/public/puzzles/index.json" not in names:
+                  raise SystemExit("APK is missing the bundled puzzle pack (assets/public/puzzles/index.json)")
+              shards = [n for n in names if n.startswith("assets/public/puzzles/band-") and n.endswith(".json")]
+
               print("APK ZIP integrity: PASS")
               print("Android manifest: PASS")
               print("DEX files:", ", ".join(sorted(dex_files)))
               print("Native Stockfish ARM64: PASS")
+              print(f"Puzzle pack shards in APK: {len(shards)}")
           PY
 
           mkdir -p "$GITHUB_WORKSPACE/output"
@@ -297,4 +393,11 @@ jobs:
           path: output/*
           if-no-files-found: error
           retention-days: 14
-          
+
+      - name: Upload Android Gradle source ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: covua-vila-android-gradle-source
+          path: ${{ runner.temp }}/covua-vila-android-gradle-source.zip
+          if-no-files-found: ignore
+          retention-days: 14
