@@ -1,4 +1,4 @@
-name: Chess Bot Android APK — WORKFLOW V1
+name: Chess Bot Android APK — WORKFLOW V9
 
 "on":
   workflow_dispatch:
@@ -29,7 +29,7 @@ jobs:
       INCLUDE_STOCKFISH_FULL: "1"
 
     steps:
-      - name: VERIFY ACTIVE WORKFLOW — V1
+      - name: VERIFY ACTIVE WORKFLOW — V9
         shell: bash
         run: |
           set -euo pipefail
